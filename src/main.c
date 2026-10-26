@@ -292,6 +292,7 @@ static void complete_transition(void);
 static void cancel_transition(void);
 static void init_image_pipeline(void);
 static bool reload_image_pipeline(const char *new_path);
+static bool reload_video_pipeline(const char *new_path);
 static void save_current_state(void);
 static int restore_from_state(const char *path);
 static void restore_video_position(void);
@@ -1905,6 +1906,24 @@ static void *handle_auto_stop(void *_) {
     pthread_exit(NULL);
 }
 
+static GstFlowReturn on_appsink_new_sample(GstElement *sink, gpointer user_data) {
+    GstSample *sample = NULL;
+    g_signal_emit_by_name(sink, "pull-sample", &sample);
+    if (sample) {
+        gst_sample_unref(sample);
+    }
+    return GST_FLOW_OK;
+}
+
+static GstFlowReturn on_appsink_new_preroll(GstElement *sink, gpointer user_data) {
+    GstSample *sample = NULL;
+    g_signal_emit_by_name(sink, "pull-preroll", &sample);
+    if (sample) {
+        gst_sample_unref(sample);
+    }
+    return GST_FLOW_OK;
+}
+
 // GStreamer event handling
 static GstPadProbeReturn buffer_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) {
     GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
@@ -2005,33 +2024,17 @@ static gboolean bus_callback(GstBus *bus, GstMessage *msg, gpointer data) {
         }
         case GST_MESSAGE_EOS:
             if (VERBOSE)
-                cflp_info("End of stream reached - fallback loop method");
-            // Fallback: if we get EOS instead of SEGMENT_DONE, still loop
-            // CHANGED 2026-07-20 - GIFs loop via plain flush seeks - Problem: avdemux_gif mishandles
-            // non-flushing segment seeks; after the first loop every buffer arrives late, sync stops
-            // throttling, and the GIF plays at decode speed (~700 loops in 20s observed)
+                cflp_info("End of stream reached - looping");
             if (pipeline && !shutting_down) {
-                GstSeekFlags eos_loop_flags = video_is_gif
-                    ? GST_SEEK_FLAG_FLUSH
-                    : (GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_SEGMENT);
-                if (!gst_element_seek_simple(pipeline, GST_FORMAT_TIME, eos_loop_flags, 0)) {
-                    cflp_warning("EOS fallback seek failed");
+                if (!gst_element_seek_simple(pipeline, GST_FORMAT_TIME,
+                                           GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT, 0)) {
+                    cflp_warning("EOS loop seek failed");
                 }
             }
             break;
         case GST_MESSAGE_SEGMENT_DONE:
             if (VERBOSE)
-                cflp_info("Segment done - seamless loop restart");
-            // CHANGED 2025-09-07 - Use segment-based seamless looping per GStreamer best practices
-            // Problem: EOS-based seeking causes playback gaps, segment seeks provide seamless transitions
-            // CHANGED 2026-07-20 - GIFs loop with a delayed flushing segment seek - Problem: avdemux_gif
-            // mishandles non-flushing segment seeks: after the first loop every buffer arrives late, sync
-            // stops throttling, and the GIF plays at decode speed (~700 loops in 20s observed). The flush
-            // resets running time so frame delays are honored each loop. SEGMENT_DONE is posted when the
-            // decoder finishes the segment, which for short GIFs is well before the sink has displayed the
-            // queued frames, so wait out the remaining display time before flushing or the loop runs fast.
-            // Regular videos keep the gapless non-flush seek; avdemux_gif also never posts EOS with
-            // playbin3, so EOS-based looping is not an option.
+                cflp_info("Segment done - looping");
             if (pipeline && video_is_gif) {
                 gint64 duration = 0;
                 if (gst_element_query_duration(pipeline, GST_FORMAT_TIME, &duration) && duration > 0) {
@@ -2050,15 +2053,13 @@ static gboolean bus_callback(GstBus *bus, GstMessage *msg, gpointer data) {
                     break;
                 gif_loop_start_us = g_get_monotonic_time();
                 if (!gst_element_seek_simple(pipeline, GST_FORMAT_TIME,
-                                           GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_SEGMENT, 0)) {
+                                           GST_SEEK_FLAG_FLUSH, 0)) {
                     cflp_warning("GIF loop seek failed");
                 }
             } else if (pipeline && !shutting_down) {
                 if (!gst_element_seek_simple(pipeline, GST_FORMAT_TIME,
-                                           GST_SEEK_FLAG_SEGMENT, 0)) {
-                    cflp_warning("Segment seek failed for seamless loop");
-                    // Fallback to regular seek
-                    gst_element_seek_simple(pipeline, GST_FORMAT_TIME, GST_SEEK_FLAG_FLUSH, 0);
+                                           GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT, 0)) {
+                    cflp_warning("Segment seek failed for loop");
                 }
             }
             break;
@@ -2075,27 +2076,7 @@ static gboolean bus_callback(GstBus *bus, GstMessage *msg, gpointer data) {
                     }
                     // Notify systemd that we're ready
                     notify_systemd_ready();
-                    
-                    // CHANGED 2025-09-07 - Initialize segment-based looping when pipeline starts
-                    // Problem: Need initial segment seek to enable SEGMENT_DONE messages instead of EOS
-                    static bool segment_initialized = false;
-                    if (!segment_initialized) {
-                        if (VERBOSE)
-                            cflp_info("Setting up seamless segment-based looping");
-                        gif_loop_start_us = g_get_monotonic_time();
-
-                        // Perform initial seek to enable segment looping
-                        if (!gst_element_seek(pipeline, 1.0, GST_FORMAT_TIME,
-                                            GST_SEEK_FLAG_SEGMENT,
-                                            GST_SEEK_TYPE_SET, 0,
-                                            GST_SEEK_TYPE_NONE, GST_CLOCK_TIME_NONE)) {
-                            cflp_warning("Failed to initialize segment looping - falling back to EOS method");
-                        } else {
-                            if (VERBOSE)
-                                cflp_success("Segment looping initialized successfully");
-                        }
-                        segment_initialized = true;
-                    }
+                    gif_loop_start_us = g_get_monotonic_time();
                 }
             }
             break;
@@ -2187,30 +2168,27 @@ static void execute_ipc_commands(void) {
         else if (strcmp(cmd_name, "resume") == 0) {
             if (!pipeline) {
                 ipc_send_response(cmd->client_fd, "ERROR: no pipeline\n");
-            } else if (!ipc_paused) {
-                // IPC holds no pause contribution; do not release pauses owned
-                // by auto-pause or the pauselist monitor
-                ipc_send_response(cmd->client_fd, "OK\n");
             } else {
+                if (ipc_paused) {
+                    if (halt_info.is_paused > 0) halt_info.is_paused--;
+                    ipc_paused = false;
+                }
+
+                // If pipeline has reached end or duration, seek to 0 to restart
+                gint64 pos = 0, dur = 0;
+                if (gst_element_query_position(pipeline, GST_FORMAT_TIME, &pos) &&
+                    gst_element_query_duration(pipeline, GST_FORMAT_TIME, &dur)) {
+                    if (dur > 0 && pos >= dur) {
+                        gst_element_seek_simple(pipeline, GST_FORMAT_TIME,
+                                               GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT, 0);
+                    }
+                }
+
                 GstStateChangeReturn ret = gst_element_set_state(pipeline, GST_STATE_PLAYING);
                 if (ret == GST_STATE_CHANGE_FAILURE) {
                     ipc_send_response(cmd->client_fd, "ERROR: failed to resume\n");
                 } else {
-                    // Wait for async state change to complete
-                    if (ret == GST_STATE_CHANGE_ASYNC) {
-                        GstStateChangeReturn wait_ret = gst_element_get_state(pipeline, NULL, NULL, 5 * GST_SECOND);
-                        if (wait_ret == GST_STATE_CHANGE_FAILURE) {
-                            ipc_send_response(cmd->client_fd, "ERROR: failed to resume\n");
-                        } else {
-                            if (halt_info.is_paused > 0) halt_info.is_paused--;
-                            ipc_paused = false;
-                            ipc_send_response(cmd->client_fd, "OK\n");
-                        }
-                    } else {
-                        if (halt_info.is_paused > 0) halt_info.is_paused--;
-                        ipc_paused = false;
-                        ipc_send_response(cmd->client_fd, "OK\n");
-                    }
+                    ipc_send_response(cmd->client_fd, "OK\n");
                 }
             }
         }
@@ -2274,23 +2252,17 @@ static void execute_ipc_commands(void) {
                             } else {
                                 ipc_send_response(cmd->client_fd, "ERROR: failed to load image\n");
                             }
-                        } else if (halt_info.argv_copy && halt_info.argc > 0) {
-                            // For videos or when auto-stop enabled, update path and restart
-                            free(halt_info.argv_copy[halt_info.argc - 1]);
-                            halt_info.argv_copy[halt_info.argc - 1] = strdup(arg);
-                            if (!halt_info.argv_copy[halt_info.argc - 1]) {
-                                ipc_send_response(cmd->client_fd, "ERROR: failed to allocate memory\n");
-                            } else {
-                                // Preserve IPC socket path in argv if set
-                                // (stop_slapper will restart with same args)
-                                ipc_send_response(cmd->client_fd, "OK\n");
-                                // Close write side to ensure response is flushed
-                                shutdown(cmd->client_fd, SHUT_WR);
-                                usleep(50000);  // Delay to ensure response is sent before restart
-                                stop_slapper();
-                            }
                         } else {
-                            ipc_send_response(cmd->client_fd, "ERROR: cannot update path (use --auto-stop for video changes)\n");
+                            // Dynamically reload video pipeline without restarting
+                            if (reload_video_pipeline(arg)) {
+                                if (halt_info.argv_copy && halt_info.argc > 0) {
+                                    free(halt_info.argv_copy[halt_info.argc - 1]);
+                                    halt_info.argv_copy[halt_info.argc - 1] = strdup(arg);
+                                }
+                                ipc_send_response(cmd->client_fd, "OK\n");
+                            } else {
+                                ipc_send_response(cmd->client_fd, "ERROR: failed to reload video\n");
+                            }
                         }
                     }
                 }
@@ -2747,6 +2719,61 @@ static void on_decodebin_pad_added(GstElement *decodebin, GstPad *pad, gpointer 
 
     gst_caps_unref(caps);
     gst_object_unref(sink_pad);
+}
+
+
+// Reload video pipeline dynamically without restarting
+static bool reload_video_pipeline(const char *new_path) {
+    if (VERBOSE)
+        cflp_info("Reloading video pipeline for: %s", new_path);
+
+    if (ipc_paused) {
+        ipc_paused = false;
+        if (halt_info.is_paused > 0) halt_info.is_paused--;
+    }
+
+    if (pipeline) {
+        gst_element_set_state(pipeline, GST_STATE_NULL);
+    }
+
+    if (video_path) {
+        free(video_path);
+    }
+    video_path = strdup(new_path);
+    if (!video_path) {
+        cflp_error("Failed to allocate memory for new path");
+        return false;
+    }
+
+    is_image_mode = false;
+    video_is_gif = is_gif_file(video_path);
+    release_cached_caps();
+    halt_info.frame_ready = 1; // Satisfy auto-stop deadman switch
+
+    char *uri = video_path;
+    char resolved_path[PATH_MAX];
+    if (strstr(video_path, "://") == NULL) {
+        if (realpath(video_path, resolved_path) == NULL) {
+            cflp_error("Failed to resolve path '%s': %s", video_path, strerror(errno));
+            return false;
+        }
+        size_t uri_len = strlen(resolved_path) + 8;
+        if (allocated_uri) free(allocated_uri);
+        allocated_uri = malloc(uri_len);
+        snprintf(allocated_uri, uri_len, "file://%s", resolved_path);
+        uri = allocated_uri;
+    }
+
+    if (pipeline) {
+        g_object_set(G_OBJECT(pipeline), "uri", uri, NULL);
+        apply_gst_options();
+        if (halt_info.is_paused == 0) {
+            gst_element_set_state(pipeline, GST_STATE_PLAYING);
+        } else {
+            gst_element_set_state(pipeline, GST_STATE_PAUSED);
+        }
+    }
+    return true;
 }
 
 // Image pipeline initialization (for static images)
@@ -3226,6 +3253,8 @@ static void init_gst(const struct wl_state *state) {
                      "max-buffers", 1,  // Limit to 1 buffer to prevent accumulation
                      NULL);
         gst_caps_unref(caps);
+        g_signal_connect(app_sink, "new-sample", G_CALLBACK(on_appsink_new_sample), NULL);
+        g_signal_connect(app_sink, "new-preroll", G_CALLBACK(on_appsink_new_preroll), NULL);
         
         g_object_set(G_OBJECT(pipeline), "video-sink", app_sink, NULL);
         
@@ -3794,9 +3823,9 @@ static void parse_command_line(int argc, char **argv, struct wl_state *state) {
                 if (fork() > 0)
                     exit(EXIT_SUCCESS);
 
-                fclose(stdout);
-                fclose(stderr);
-                fclose(stdin);
+                freopen("/dev/null", "r", stdin);
+                freopen("/dev/null", "w", stdout);
+                freopen("/dev/null", "w", stderr);
                 break;
             case 'p':
                 halt_info.auto_pause = 1;
