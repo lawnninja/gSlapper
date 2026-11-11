@@ -2194,7 +2194,7 @@ static void execute_ipc_commands(void) {
         }
         else if (strcmp(cmd_name, "query") == 0) {
             char response[512];
-            const char *state = (halt_info.is_paused > 0) ? "paused" : "playing";
+            const char *state = ipc_paused ? "paused" : "playing";
             const char *mode = is_image_mode ? "image" : "video";
             const char *path = video_path ? video_path : "unknown";
             snprintf(response, sizeof(response), "STATUS: %s %s %s\n", state, mode, path);
